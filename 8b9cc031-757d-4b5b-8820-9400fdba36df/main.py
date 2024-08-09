@@ -1,265 +1,191 @@
+#region imports
+from AlgorithmImports import *
 import numpy as np
-import pandas as pd
-import random
-import time
-import os
-from sklearn.preprocessing import OneHotEncoder, RobustScaler
-from tensorflow.keras.layers import LSTM, Dropout, Dense, Input
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, CSVLogger
-from tensorflow.keras.models import Model, load_model
-from tensorflow.keras import optimizers
-import tensorflow as tf
+from collections import deque
+import statsmodels.api as sm
+import statistics as stat
+import pickle
+#endregion
 
-# Set seeds for reproducibility
-SEED = 9
-os.environ['PYTHONHASHSEED'] = str(SEED)
-random.seed(SEED)
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
+class Q2PlaygroundAlgorithm(QCAlgorithm):
+    def initialize(self):
+        self.set_start_date(2008, 1, 1)   # Set Start Date
+        self.set_cash(100000)             # Set Strategy Cash
+        self.set_security_initializer(BrokerageModelSecurityInitializer(
+            self.BrokerageModel, FuncSecuritySeeder(self.GetLastKnownPrices)
+        ))
+        ########################## PARAMETERS ##########################
+        # self.p_lookback = self.get_parameter("p_lookback", 252)
+        # self.p_num_coarse = self.get_parameter("p_num_coarse", 200)
+        # self.p_num_fine = self.get_parameter("p_num_fine", 70)
+        # self.p_num_long = self.get_parameter("p_num_long", 5)
+        # self.p_adjustment_step = self.get_parameter("p_adjustment_step", 1.0)
+        # self.p_n_portfolios = self.get_parameter("p_n_portfolios", 1000)
+        # self.p_short_lookback = self.get_parameter("p_short_lookback", 63)
+        # self.p_rand_seed = self.get_parameter("p_rand_seed", 13)
+        ################################################################
+        self.p_lookback = 252
+        self.p_num_coarse = 200
+        self.p_num_fine = 70
+        self.p_num_long = 5
+        self.p_adjustment_step = 1.0
+        self.p_n_portfolios = 1000
+        self.p_short_lookback = 63
+        self.p_rand_seed = 13
+        self.p_adjustment_frequency = 'monthly'  # Can be 'monthly', 'weekly', 'bi-weekly'
+        ################################################################
+        self.universe_settings.resolution = Resolution.DAILY
 
-# Ensure the GPU is detected (if available)
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        # Restrict TensorFlow to only allocate 1GB of memory on the first GPU
-        tf.config.set_logical_device_configuration(
-            gpus[0],
-            [tf.config.LogicalDeviceConfiguration(memory_limit=1024)]
-        )
-        logical_gpus = tf.config.list_logical_devices('GPU')
-        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
-    except RuntimeError as e:
-        print(e)
-else:
-    print("No GPU found. Running on CPU.")
+        self._momp = {}          # Dict of Momentum indicator keyed by Symbol
+        self._lookback = self.p_lookback     # Momentum indicator lookback period
+        self._num_coarse = self.p_num_coarse # Number of symbols selected at Coarse Selection
+        self._num_fine = self.p_num_fine     # Number of symbols selected at Fine Selection
+        self._num_long = self.p_num_long     # Number of symbols with open positions
 
-# Load data
-SP500_df = pd.read_csv('data/SPXconst.csv')
-all_companies = list(set(SP500_df.values.flatten()))
-all_companies.remove(np.nan)
+        self._rebalance = False
+        self.current_holdings = set()  # To track current holdings
 
-constituents = {'-'.join(col.split('/')[::-1]): set(SP500_df[col].dropna()) for col in SP500_df.columns}
+        self.target_weights = {}  # To store target weights
+        self.adjustment_step = self.p_adjustment_step  # Adjustment step for gradual transition
 
-constituents_train = {}
-for test_year in range(1993, 2016):
-    months = [f"{t}-{'0' if m < 10 else ''}{m}" for t in range(test_year-3, test_year) for m in range(1, 13)]
-    constituents_train[test_year] = set(company for m in months for company in constituents.get(m, []))
+        self.first_trade_date = None
+        self.next_adjustment_date = None
 
-def makeLSTM():
-    inputs = Input(shape=(240, 1))  # Expecting 240 time steps with 1 feature
-    x = LSTM(25, return_sequences=False)(inputs)
-    x = Dropout(0.1)(x)
-    outputs = Dense(2, activation='softmax')(x)
-    model = Model(inputs=inputs, outputs=outputs)
-    model.compile(loss='categorical_crossentropy', optimizer=optimizers.RMSprop(), metrics=['accuracy'])
-    model.summary()
-    return model
+        self.add_universe(self._coarse_selection_function, self._fine_selection_function)
 
-def callbacks_req(model_type='LSTM'):
-    csv_logger = CSVLogger(f"{model_folder}/training-log-{model_type}-{test_year}.csv")
-    filepath = f"{model_folder}/model-{model_type}-{test_year}-E{{epoch:02d}}.keras"  # Updated file extension
-    model_checkpoint = ModelCheckpoint(filepath, monitor='val_loss', save_best_only=False, save_freq='epoch')
-    early_stopping = EarlyStopping(monitor='val_loss', mode='min', patience=10, restore_best_weights=True)
-    return [csv_logger, early_stopping, model_checkpoint]
+    def _coarse_selection_function(self, coarse):
+        '''Drop securities which have no fundamental data or have too low prices.
+        Select those with highest by dollar volume'''
+        if self.next_adjustment_date and self.time < self.next_adjustment_date:
+            return Universe.UNCHANGED
 
-def reshaper(arr):
-    arr = np.array(np.split(arr, 3, axis=1))
-    arr = np.swapaxes(arr, 0, 1)
-    arr = np.swapaxes(arr, 1, 2)
-    return arr
+        self._rebalance = True
 
-def trainer(train_data, test_data, model_type='LSTM'):
-    np.random.shuffle(train_data)
-    # Make sure to select exactly 240 columns for train_x
-    train_x, train_y, train_ret = train_data[:, 2:242], train_data[:, -1], train_data[:, -2]
+        if not self.first_trade_date:
+            self.first_trade_date = self.time
+            self.next_adjustment_date = self.get_next_adjustment_date(self.time)
+            self._rebalance = True
 
-    # Calculate the number of features for reshaping
-    num_features = train_x.shape[1]
+        selected = sorted([x for x in coarse if x.has_fundamental_data and x.price > 5],
+            key=lambda x: x.dollar_volume, reverse=True)
 
-    # Reshape with calculated features
-    train_x = np.reshape(train_x, (len(train_x), num_features, 1)).astype(np.float32)
-    train_y = np.reshape(train_y, (-1, 1)).astype(np.float32)
-    train_ret = np.reshape(train_ret, (-1, 1)).astype(np.float32)
-    
-    # Encoding the labels
-    enc = OneHotEncoder(handle_unknown='ignore')
-    enc.fit(train_y)
-    enc_y = enc.transform(train_y).toarray()
-    train_ret = np.hstack((np.zeros((len(train_data), 1)), train_ret))
+        return [x.symbol for x in selected[:self._num_coarse]]
 
-    if model_type == 'LSTM':
-        model = makeLSTM()
-    else:
-        return
+    def _fine_selection_function(self, fine):
+        '''Select security with highest market cap'''
+        selected = sorted(fine, key=lambda f: f.market_cap, reverse=True)
+        return [x.symbol for x in selected[:self._num_fine]]
 
-    callbacks = callbacks_req(model_type)
-    
-    model.fit(
-        train_x,
-        enc_y,
-        epochs=1000,
-        validation_split=0.2,
-        callbacks=callbacks,
-        batch_size=512
-    )
+    def on_data(self, data):
+        # Update the indicator
+        for symbol, mom in self._momp.items():
+            mom.update(self.time, self.securities[symbol].close)
 
-    dates = list(set(test_data[:, 0]))
-    predictions = {}
-    for day in dates:
-        test_d = test_data[test_data[:, 0] == day]
-        test_d = np.reshape(test_d[:, 2:242], (len(test_d), num_features, 1)).astype(np.float32)
-        predictions[day] = model.predict(test_d)[:, 1]
-    return model, predictions
+        # Check if empty portfolio and set first_trade_date
+        if not self.Portfolio.Invested and not self.first_trade_date:
+            self.first_trade_date = self.time
+            self.next_adjustment_date = self.get_next_adjustment_date(self.time, initial=True)
+            self._rebalance = True
 
-def trained(filename, train_data, test_data):
-    model = load_model(filename)
+        if not self._rebalance:
+            return
 
-    dates = list(set(test_data[:, 0]))
-    predictions = {}
-    for day in dates:
-        test_d = test_data[test_data[:, 0] == day]
-        test_d = np.reshape(test_d[:, 2:242], (len(test_d), test_d.shape[1] - 4, 1)).astype(np.float32)
-        predictions[day] = model.predict(test_d)[:, 1]
-    return model, predictions
+        # Selects the securities with highest momentum
+        sorted_mom = sorted([k for k,v in self._momp.items() if v.is_ready],
+            key=lambda x: self._momp[x].current.value, reverse=True)
+        selected = sorted_mom[:self._num_long]
+        new_holdings = set(selected)
 
-def simulate(test_data, predictions):
-    rets = pd.DataFrame([], columns=['Long', 'Short'])
-    k = 10
-    for day in sorted(predictions.keys()):
-        preds = predictions[day]
-        test_returns = test_data[test_data[:, 0] == day][:, -2]
-        top_preds = predictions[day].argsort()[-k:][::-1]
-        trans_long = test_returns[top_preds]
-        worst_preds = predictions[day].argsort()[:k][::-1]
-        trans_short = -test_returns[worst_preds]
-        rets.loc[day] = [np.mean(trans_long), np.mean(trans_short)]
-    print('Result : ', rets.mean())
-    return rets
+        # Only rebalance if the new selection is different from current holdings
+        if new_holdings != self.current_holdings or self.first_trade_date == self.time:
+            if len(selected) > 0:
+                optimal_weights = self.optimize_portfolio(selected)
+                self.target_weights = dict(zip(selected, optimal_weights))
+                self.current_holdings = new_holdings
+                self.adjust_portfolio()
 
-def create_label(df_open, df_close, perc=[0.5, 0.5]):
-    if not np.all(df_close.iloc[:, 0] == df_open.iloc[:, 0]):
-        print('Date Index issue')
-        return
-    perc = [0.] + list(np.cumsum(perc))
-    label = (df_close.iloc[:, 1:] / df_open.iloc[:, 1:] - 1).apply(
-        lambda x: pd.qcut(x.rank(method='first'), perc, labels=False), axis=1)
-    return label[1:]
+        self._rebalance = False
+        self.next_adjustment_date = self.get_next_adjustment_date(self.time)
 
-def create_stock_data(df_open, df_close, st, m=240):
-    """
-    Create stock data for a given stock `st`, including intraday returns and future intraday return.
+    def on_securities_changed(self, changes):
+        # Clean up data for removed securities and Liquidate
+        for security in changes.RemovedSecurities:
+            symbol = security.Symbol
+            if self._momp.pop(symbol, None) is not None:
+                self.Liquidate(symbol, 'Removed from universe')
 
-    Args:
-    df_open (DataFrame): DataFrame with opening prices.
-    df_close (DataFrame): DataFrame with closing prices.
-    st (str): Stock ticker symbol.
-    m (int): Number of previous days to include for intraday returns.
+        for security in changes.AddedSecurities:
+            if security.Symbol not in self._momp:
+                self._momp[security.Symbol] = MomentumPercent(self._lookback)
 
-    Returns:
-    tuple: Tuple containing numpy arrays for training and testing data.
-    """
-    # Initialize a list to collect the data
-    data = {
-        'Date': df_close['Date'],
-        'Name': [st] * len(df_close),
-    }
+        # Warm up the indicator with history price if it is not ready
+        added_symbols = [k for k, v in self._momp.items() if not v.IsReady]
 
-    # Calculate daily change
-    daily_change = df_close[st] / df_open[st] - 1
+        history = self.History(added_symbols, 1 + self._lookback, Resolution.Daily)
+        history = history.close.unstack(level=0)
 
-    # Collect shifted intraday return columns
-    for k in range(m):
-        data[f'IntraR{k}'] = daily_change.shift(k)
+        for symbol in added_symbols:
+            ticker = symbol.ID.ToString()
+            if ticker in history:
+                for time, value in history[ticker].dropna().items():
+                    item = IndicatorDataPoint(symbol, time.date(), value)
+                    self._momp[symbol].Update(item)
 
-    # Add future return and labels
-    data['IntraR-future'] = daily_change.shift(-1)
-    data['label'] = list(label[st]) + [np.nan]
-    data['Month'] = df_close['Date'].str[:-3]
+    def optimize_portfolio(self, selected_symbols):
+        short_lookback = self.p_short_lookback
+        returns = self.history(selected_symbols, short_lookback, Resolution.DAILY)['close'].unstack(level=0).pct_change().dropna()
+        n_assets = len(selected_symbols)
+        n_portfolios = self.p_n_portfolios
 
-    # Convert dictionary to DataFrame
-    st_data = pd.DataFrame(data).dropna()
+        results = np.zeros((3, n_portfolios))
+        weights_record = []
 
-    # Split data into training and testing sets
-    trade_year = st_data['Month'].str[:4]
-    st_data = st_data.drop(columns=['Month'])
-    st_train_data = st_data[trade_year < str(test_year)]
-    st_test_data = st_data[trade_year == str(test_year)]
+        np.random.seed(self.p_rand_seed)
 
-    # Convert to numpy array excluding non-numeric columns
-    train_numeric = st_train_data.drop(columns=['Date', 'Name']).to_numpy().astype(np.float32)
-    test_numeric = st_test_data.drop(columns=['Date', 'Name']).to_numpy().astype(np.float32)
+        for i in range(n_portfolios):
+            weights = np.random.random(n_assets)
+            weights /= np.sum(weights)
 
-    return train_numeric, test_numeric
+            portfolio_return = np.sum(returns.mean() * weights) * short_lookback
+            portfolio_stddev = np.sqrt(np.dot(weights.T, np.dot(returns.cov() * short_lookback, weights)))
 
-def scalar_normalize(train_data, test_data):
-    scaler = RobustScaler()
-    scaler.fit(train_data[:, :-2])
-    train_data[:, :-2] = scaler.transform(train_data[:, :-2])
-    test_data[:, :-2] = scaler.transform(test_data[:, :-2])
+            downside_stddev = np.sqrt(np.mean(np.minimum(0, returns).apply(lambda x: x**2, axis=0).dot(weights)))
+            sortino_ratio = portfolio_return / downside_stddev
 
-# Set directories for models and results
-model_folder = 'models-Intraday-240-1-LSTM'
-result_folder = 'results-Intraday-240-1-LSTM'
-for directory in [model_folder, result_folder]:
-    if not os.path.exists(directory):
-        os.makedirs(directory)
+            results[0,i] = portfolio_return
+            results[1,i] = portfolio_stddev
+            results[2,i] = sortino_ratio
 
-# Run training and testing for each year
-for test_year in range(1993, 2020):
-    print('-' * 40)
-    print(test_year)
-    print('-' * 40)
-    
-    # Load opening and closing prices
-    filename_open = f'data/Open-{test_year-3}.csv'
-    filename_close = f'data/Close-{test_year-3}.csv'
-    
-    df_open = pd.read_csv(filename_open)
-    df_close = pd.read_csv(filename_close)
-    
-    # Create labels for training data
-    label = create_label(df_open, df_close)
-    
-    # Filter stocks by available data
-    stock_names = sorted(list(constituents[f'{test_year-1}-12']))
-    
-    train_data, test_data = [], []
-    start = time.time()
-    
-    # Prepare training and testing data for each stock
-    for st in stock_names:
-        st_train_data, st_test_data = create_stock_data(df_open, df_close, st)
-        train_data.append(st_train_data)
-        test_data.append(st_test_data)
-        
-    # Concatenate data arrays for model input
-    train_data = np.concatenate(train_data).astype(np.float32)
-    test_data = np.concatenate(test_data).astype(np.float32)
-    
-    # Normalize the data
-    scalar_normalize(train_data, test_data)
-    
-    print(f"Training data shape: {train_data.shape}, Testing data shape: {test_data.shape}, Time taken: {time.time() - start:.2f}s")
-    
-    # Train the model and make predictions
-    model, predictions = trainer(train_data, test_data)
-    
-    # Simulate results and save returns
-    returns = simulate(test_data, predictions)
-    returns.to_csv(f'{result_folder}/avg_daily_rets-{test_year}.csv')
-    
-    # Generate statistics and save results
-    # Assuming Statistics is a custom module, replace with actual statistics computation if needed
-    # result = Statistics(returns.sum(axis=1))
-    # print('\nAverage returns prior to transaction charges')
-    # result.shortreport() 
-    
-    # Append results to a summary file
-    with open(f'{result_folder}/avg_returns.txt', "a") as myfile:
-        res = '-' * 30 + '\n'
-        res += str(test_year) + '\n'
-        # Replace result.mean() and result.sharpe() with actual mean and sharpe computation if needed
-        res += 'Mean = ' + str(returns.mean().mean()) + '\n'
-        # res += 'Sharpe = ' + str(result.sharpe()) + '\n'
-        res += '-' * 30 + '\n'
-        myfile.write(res)
+            weights_record.append(weights)
+
+        best_sortino_idx = np.argmax(results[2])
+        return weights_record[best_sortino_idx]
+
+    def adjust_portfolio(self):
+        current_symbols = set(self.Portfolio.Keys)
+        target_symbols = set(self.target_weights.keys())
+
+        # Liquidate removed symbols
+        removed_symbols = current_symbols - target_symbols
+        for symbol in removed_symbols:
+            self.Liquidate(symbol)
+
+        # Adjust holdings for selected symbols
+        for symbol, target_weight in self.target_weights.items():
+            current_weight = self.Portfolio[symbol].Quantity / self.Portfolio.TotalPortfolioValue if symbol in self.Portfolio else 0
+            adjusted_weight = current_weight * (1 - self.adjustment_step) + target_weight * self.adjustment_step
+            self.SetHoldings(symbol, adjusted_weight)
+
+    def get_next_adjustment_date(self, current_date, initial=False):
+        if self.p_adjustment_frequency == 'weekly':
+            return current_date + timedelta(days=7)
+        elif self.p_adjustment_frequency == 'bi-weekly':
+            return current_date + timedelta(days=14)
+        elif self.p_adjustment_frequency == 'monthly':
+            if initial:
+                next_month = current_date.replace(day=1) + timedelta(days=32)
+                return next_month.replace(day=1)
+            next_month = current_date.replace(day=1) + timedelta(days=32)
+            return next_month.replace(day=1)
+        else:
+            raise ValueError(f"Unsupported adjustment frequency: {self.p_adjustment_frequency}")
